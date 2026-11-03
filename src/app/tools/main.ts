@@ -22,7 +22,7 @@ export interface MainToolsHost {
   readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'modelFallbackStatus' | 'resetModelFallback'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
@@ -244,6 +244,12 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       execute: async args => {
         return { removed: host.quietly(() => host.engine.unsubscribe(args.thread)), thread: args.thread }
       },
+    }),
+    tool({
+      name: 'orchestrator_model_fallback_reset',
+      description: 'Reset every ticket\'s worker model to the first model of the configured fallback chain on an explicit person\'s request to reset the model now, clearing each ticket\'s switch count; automatic fallback still applies to later provider failures.',
+      schema: z.object({}).strict(),
+      execute: async () => host.sessions.resetModelFallback(),
     }),
     tool({
       name: 'orchestrator_settings_save',

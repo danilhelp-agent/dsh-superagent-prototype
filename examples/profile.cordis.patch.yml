@@ -7,6 +7,15 @@
 - id: dsh-superagent
   config:
     stateDir: <absolute path, for example /home/me/.dsh/state/superagent>
+    # Optional provider fallback: the first route is the primary model. Comment out to keep every Ticket on its role model.
+    modelFallback:
+      models:
+        - { provider: deepseek-account, model: deepseek-flash }
+        - { provider: openrouter, model: thinkingmachines/inkling:free }
+        - { provider: groq, model: openai/gpt-oss-120b }
+      maxSwitches: 7
+      contextThreshold: 0.15
+      handoffFile: HANDOFF.md
 # Feishu is optional: uncomment to enable its Source, then set the bot's lark-cli on the Feishu Source.
 # - id: dsh-superagent-feishu
 #   disabled: false
