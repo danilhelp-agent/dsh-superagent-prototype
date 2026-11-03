@@ -16,6 +16,8 @@ import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
+import { ModelFallback } from './model-fallback.ts'
+import type { ModelFallback as ModelFallbackConfig } from '../deployment.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
@@ -29,6 +31,8 @@ export interface SessionsHost {
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
+  /** The provider fallback chain and its limits, from the plugin configuration; an empty chain turns fallback off. */
+  readonly modelFallback: ModelFallbackConfig
   readonly masterId: string
   readonly lifetime: AbortSignal
   closing(): boolean
@@ -95,11 +99,34 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  /** Switches a ticket's model on a provider failure and keeps its HANDOFF.md; absent while the configured chain cannot fall back. */
+  private readonly modelFallback: ModelFallback
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
+    this.modelFallback = new ModelFallback({
+      context: this.ctx,
+      lifetime: host.lifetime,
+      config: host.modelFallback,
+      save: (ticketId, record) => host.store.set(KV.sessions.modelFallback(ticketId), record),
+      load: ticketId => host.store.get(KV.sessions.modelFallback(ticketId)),
+      notify: (agent, requestId, text, summary) => this.agentDelivery.send(agent, requestId, text, { inject: summary }, host.lifetime),
+      pressure: session => {
+        // The token meter is a DSH plugin, not a dependency of this bundle: read its projection when the profile mounts one.
+        try {
+          const projections = this.ctx.get('sessionProjections') as { snapshot(session: unknown, keys: string[]): { values: Record<string, unknown> } } | undefined
+          const value = projections?.snapshot(session, ['contextPressure']).values.contextPressure as
+            { projectedTokens?: number; pressureTokens?: number; contextWindow?: number } | undefined
+          return value ? { projectedTokens: value.projectedTokens ?? value.pressureTokens, contextWindow: value.contextWindow } : undefined
+        } catch { return undefined /* No token meter, or a Session it cannot project yet. */ }
+      },
+      describe: ticketId => {
+        const ticket = host.store.tickets.get(ticketId)
+        return ticket ? { title: ticket.title, goal: ticket.mandate.scope } : undefined
+      },
+    })
     // Deliver relays and notices to the main Session in the order they were queued.
     host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
@@ -117,6 +144,7 @@ export class Sessions {
       if (!agent || !binding || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
       this.updateModelHealth()
+      this.modelFallback.observe(agent, event)
     })
     ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined })
     // Opening a Session in DSH's Web UI before its first turn may select the default preset for it: select ours again. After
@@ -214,6 +242,10 @@ export class Sessions {
         execute: (args, execution) => execute(schema.parse(args), execution.signal) }))
     }
   }
+  /** Returns `sessionId`'s model fallback status (`{ model_fallback }`) after its first switch, or `{}` before one. */
+  modelFallbackStatus(sessionId: string | undefined) { return this.modelFallback.status(sessionId) }
+  /** Return every live ticket's model to the first route of the configured chain on a person's explicit request, clearing its switch count. */
+  resetModelFallback() { return this.modelFallback.reset() }
   /** Returns `sessionId`'s active model-budget retry state (`{ model_retry }`) for status listings, or `{}` when not waiting on one. */
   modelRetry(sessionId: string | undefined) {
     const retry = sessionId ? this.retryHealth.get(sessionId) : undefined
@@ -265,6 +297,7 @@ export class Sessions {
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
+      this.modelFallback.attach(agent, ticket!.id, ticket!.execution?.directory ?? agent.session.header.cwd ?? process.cwd())
     }
   }
   /**
@@ -339,6 +372,7 @@ export class Sessions {
   }
   /** Releases registrations for `agent` in reverse order (LIFO); disposing its skill scope releases its skills as well. */
   private release(agent: Agent): void {
+    this.modelFallback.detach(agent)
     const binding = this.bindings.get(agent)
     if (!binding) return
     this.bindings.delete(agent)

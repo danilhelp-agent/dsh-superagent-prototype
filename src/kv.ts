@@ -2,6 +2,7 @@
  * Typed key-value store keys and key families grouped by the single component that owns and writes each family.
  * Readers and writers refer to a record by its entry here so each key is spelled once with its value type.
  */
+import type { FallbackRecord } from './app/model-fallback.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
@@ -32,7 +33,9 @@ export const KV = {
   /** Runtime: the main Session's ID. */
   runtime: { masterId: record<string>('master-id') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
-  sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
+  sessions: { prompts: family<number[], [session: string]>('session-prompts:'),
+    /** Per-ticket model fallback accounting: the fallback route in force, its switches, and whether the chain ended. */
+    modelFallback: family<FallbackRecord, [ticket: string]>('session-model-fallback:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },

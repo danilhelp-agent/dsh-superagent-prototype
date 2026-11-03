@@ -70,7 +70,7 @@ export interface ResourceHost {
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
 }
 export interface MainResourceHost extends ResourceHost {
-  readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
+  readonly sessions: Pick<Sessions, 'status' | 'modelRetry' | 'modelFallbackStatus'>
   readonly settings: Pick<Settings, 'view' | 'block'>
 }
 interface Read {
@@ -118,7 +118,10 @@ async function transcript(host: ResourceHost, ticketId: string) {
 const ROUTES: readonly Route[] = [
   ['tickets', read => {
     const host = main(read), tickets = host.store.tickets.list()
-    const card = (ticket: Ticket) => ({ ...ticketCard(ticket), ...host.sessions.modelRetry(runningAssignment(ticket) && workerSessionId(ticket.id)) })
+    const card = (ticket: Ticket) => {
+      const running = runningAssignment(ticket) && workerSessionId(ticket.id)
+      return { ...ticketCard(ticket), ...host.sessions.modelRetry(running), ...host.sessions.modelFallbackStatus(running) }
+    }
     return list(read, (offset, count) => tickets.slice(offset, offset + count).map(card))
   }],
   ['triggers', read => {
@@ -242,6 +245,7 @@ const ROUTES: readonly Route[] = [
     if (section === undefined) {
       const running = runningAssignment(ticket) && workerSessionId(ticket.id)
       const retry = 'sessions' in host ? (host as MainResourceHost).sessions.modelRetry(running) : {}
+      const fallback = 'sessions' in host ? (host as MainResourceHost).sessions.modelFallbackStatus(running) : {}
       // Merge subscribed threads (including context-only subscriptions) and source-bound threads without duplicates.
       const bound = new Set((ticket.follows ?? []).map(follow => follow.thread))
       const subscribed = host.store.read.subscribedThreads().filter(thread => thread.subscriptions.includes(id))
@@ -249,7 +253,7 @@ const ROUTES: readonly Route[] = [
         ({ thread: key, ...context ? { context: true } : {}, ...bound.has(key) ? { bound: true } : {} })
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
-      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
+      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry, ...fallback }
     }
     if (section === 'assignments' || section === 'inputs') {
       if (part !== undefined) throw new Error('Unknown context resource')

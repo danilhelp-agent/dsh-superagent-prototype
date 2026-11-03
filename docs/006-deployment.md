@@ -94,8 +94,45 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | --- | --- | --- |
 | `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
+| `modelFallback` | no | Provider fallback for a Ticket whose model route fails: `models` (the chain, first is primary), `maxSwitches` (default 7), `contextThreshold` (default 0.15) and `handoffFile` (default `HANDOFF.md`) |
 
 After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
+
+### Model fallback and HANDOFF.md
+
+A provider can end its quota, refuse a credential or keep rate-limiting in the middle of a Ticket. With `modelFallback` configured, the plugin watches each Executor Session for DSH's `agent/request-error` and switches the Session's model to the next route in `models`:
+
+- `QUOTA`, `ACCOUNT_QUOTA` and `INVALID_CREDENTIAL` switch at once;
+- `RATE_LIMIT` switches only after DSH's own retries for the route are exhausted;
+- every other failure is left to the ordinary retry and error path.
+
+The first route is the primary model, so a Ticket switches to the second route on its first failure. A duplicate route is refused at startup. A Ticket makes at most `maxSwitches` switches; when that limit or the end of the chain is reached, the Session returns to the primary route and the failure reaches the Ticket, so the next Ticket starts on the primary model. The switch accounting is stored per Ticket and resumed by its next Assignment, and every switch appears under `model_fallback` on the Ticket card and in the worker's next report.
+
+The worker is asked to keep `HANDOFF.md` in its Ticket directory (never committed): below `contextThreshold` of the context window it is told to write the goal, work done, checks passed and failed, what remains, known problems and the stopping point in at most 150 lines. Before a switch the plugin writes a factual note when the file does not exist yet, and after a switch or a compaction it tells the worker to read and update the file. A person-written handoff is never overwritten.
+
+To return every running Ticket to the primary route now, ask the main Session to reset the model (it calls `orchestrator_model_fallback_reset`), or call the management route:
+
+```sh
+curl -sS -X POST http://127.0.0.1:3082/orchestrator/api/model-fallback/reset \
+  -H 'x-orchestrator-request: 1'
+```
+
+The reset clears each Ticket's switch count; automatic fallback still applies to later provider failures. Editing `models` needs a restart of the profile, not a build or reinstall.
+
+```yaml
+- id: dsh-superagent
+  config:
+    stateDir: /home/agent/.dsh/state/superagent
+    modelFallback:
+      models:
+        - { provider: deepseek-account, model: deepseek-flash }
+        - { provider: openrouter, model: thinkingmachines/inkling:free }
+        - { provider: groq, model: openai/gpt-oss-120b }
+      maxSwitches: 7
+      contextThreshold: 0.15
+      handoffFile: HANDOFF.md
+```
+
 
 ## Start and stop
 

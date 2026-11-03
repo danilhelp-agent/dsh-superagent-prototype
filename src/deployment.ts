@@ -11,8 +11,38 @@ import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
 const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
+/** One provider route in the model fallback chain; the first route is the primary model. */
+export interface FallbackModel { provider: string; model: string; reasoningEffort?: string }
+/** Resolved model fallback settings: the provider chain, its per-ticket switch limit and the context threshold that asks for a handoff. */
+export interface ModelFallback { models: readonly FallbackModel[]; maxSwitches: number; contextThreshold: number; handoffFile: string }
+const FallbackRoute = s.object({
+  provider: s.string().required().description('Provider route, such as openrouter, groq or deepseek-account.'),
+  model: s.string().required().description('Provider-owned model id.'),
+  reasoningEffort: s.string().description('Adapter-owned reasoning effort for this route; omitted, the provider default applies.'),
+}).description('One route of the fallback chain, as provider and model.')
+/** The plugin configuration's resolved shape: `Config` validates the profile's YAML into it, and the loader passes it to `apply`. */
+export interface DeploymentConfig {
+  stateDir: string
+  promptMaxChars: Volatile<number>
+  admissionContextMaxPages: Volatile<number>
+  admissionContextTimeoutMs: Volatile<number>
+  modelFallback: ModelFallback
+}
+/** The configuration values a profile writes before `Config` applies its defaults; only `stateDir` is required. */
+export interface ConfigInput {
+  stateDir: string
+  promptMaxChars?: number
+  admissionContextMaxPages?: number
+  admissionContextTimeoutMs?: number
+  modelFallback?: Partial<ModelFallback>
+}
+/** The typing of the configuration schema without exposing schemastery's `Dict` inference, which declaration emit cannot name. */
+export interface ConfigSchema {
+  (data?: Partial<ConfigInput> | null): DeploymentConfig
+  readonly dict?: Record<string, unknown>
+}
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
-export const Config = s.object({
+export const Config: ConfigSchema = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
   promptMaxChars: s.number().min(LIMITS.promptMaxChars.min).max(LIMITS.promptMaxChars.max).step(1).default(100000)
     .description('Largest saved prompt configuration, in characters.').volatile(),
@@ -20,13 +50,23 @@ export const Config = s.object({
     .description('Pages of thread context one assessment may read.').volatile(),
   admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
     .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
-})
-export type DeploymentConfig = ReturnType<typeof Config>
+  modelFallback: s.object({
+    models: s.array(FallbackRoute).default([])
+      .description('Fallback chain in order; the first route is the primary model. An empty list, or a single route, turns automatic fallback off.'),
+    maxSwitches: s.number().min(1).max(50).step(1).default(7)
+      .description('Most model switches one ticket may make before it stops and returns to the primary model.'),
+    contextThreshold: s.number().min(0.01).max(0.5).default(0.15)
+      .description('Remaining share of the context window below which the worker is asked to write HANDOFF.md.'),
+    handoffFile: s.string().default('HANDOFF.md')
+      .description('Handoff file name in the ticket directory; the plugin never commits it.'),
+  }).description('Provider fallback for a ticket whose current model route fails with QUOTA, INVALID_CREDENTIAL or an exhausted RATE_LIMIT: the plugin switches to the next route and asks the worker to keep HANDOFF.md.'),
+}) as unknown as ConfigSchema
 export interface Machine {
   stateDir: string
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
+  modelFallback: ModelFallback
 }
 const MOVED: Record<string, string> = {
   repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
@@ -38,8 +78,15 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } = config
-  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, modelFallback } = config
+  // A duplicate route would switch to a model the chain already failed on; reject it at startup instead of looping between the two.
+  const seen = new Set<string>()
+  for (const [index, route] of modelFallback.models.entries()) {
+    const id = `${route.provider}/${route.model}`
+    if (seen.has(id)) throw new Error(`dsh-superagent modelFallback.models has duplicate route "${id}" at index ${index}`)
+    seen.add(id)
+  }
+  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, modelFallback }
 }
 
 export const GithubAccountsSchema = z.object({
